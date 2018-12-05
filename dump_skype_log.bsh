@@ -1,0 +1,185 @@
+#!/bin/bash
+
+# Copyright (C) 2018 Jaak Pruulmann-Vengerfeldt <jjpp+dsl@meso.ee>
+# License: CC BY-SA 
+
+# It may or may not suite your particular purpose. 
+# Attn: Having the username and the password in environment may not be the most secure solution. 
+
+# Most of it is inspired by https://github.com/EionRobb/skype4pidgin/tree/master/skypeweb
+# timed_hmac: Eion writes: Blatantly stolen from MSN prpl, with super-secret SHA256 change!
+
+# Requires: 
+# 	curl (http://curl.haxx.se)
+#	jq (https://github.com/stedolan/jq)
+#	openssl 
+#	sed
+#	coreutils (tr, mktemp, od, date)
+# 
+
+# Usage: ./dump_skype_log.bsh [since]
+#
+# Logs in to Skype web and tries to dump all the conversations that have had activities
+# after "since". Since should be given as strings that date(1) can parse. Default is "last month".
+#
+
+CONFIG_FILE="$HOME/.config/dump_skype.conf"
+[ -r "$CONFIG_FILE" ] && source "$CONFIG_FILE"
+
+if [ -z "$USERNAME" -o -z "$PASSWORD" ]; then
+	echo "Please set up $CONFIG_FILE, a regular shell script that sets "
+	echo "variables USERNAME and PASSWORD to your Skype username and password"
+	echo "or set them in the environment before running this script."
+	exit 1
+fi
+
+# could be overridden in config file as well. 
+OUTPUT_DIR="${OUTPUT_DIR:-"out"}"
+
+
+MESSAGES_HOST=client-s.gateway.messenger.live.com
+LOCKANDKEY_APPID="msmsgs@msnmsgr.com"
+LOCKANDKEY_SECRET="Q1P7W2E4J9R8U3S5"
+
+SINCE="${1:-"last month"}"
+
+COOKIE_JAR=`mktemp /tmp/dsl-cookies-XXXXX`
+WITH_COOKIES="-b $COOKIE_JAR -c $COOKIE_JAR"
+
+# Get PPFT 
+PPFT="`curl $WITH_COOKIES -sL "https://login.skype.com/login/oauth/microsoft?client_id=578134&redirect_uri=https%3A%2F%2Fweb.skype.com" | \
+	tr -d "\n" | sed -e 's/^.*name="PPFT" id="i0327" value="//' -e 's/".*$//'`"
+
+# Get T
+T="`curl $WITH_COOKIES -sL "https://login.live.com/ppsecure/post.srf?wa=wsignin1.0&wp=MBI_SSL&wreply=https%3A%2F%2Flw.skype.com%2Flogin%2Foauth%2Fproxy%3Fsite_name%3Dlw.skype.com" \
+	-d login="$USERNAME" -d passwd="$PASSWORD" -d PPFT="$PPFT" -d loginoptions=3 \
+	-H "Accept: */*" -H "Content-type: application/x-www-form-urlencoded; charset=UTF-8" | \
+	tr -d "\n" | sed -e 's/^.*="t" value="//' -e 's/".*$//'`"
+
+# Get skype session ?
+
+VERIFY_RESPONSE="`curl $WITH_COOKIES -sL "https://login.skype.com/login/microsoft" \
+	-d t="$T" -d site_name=lw.skype.com -d oauthPartner=999 -d client_id=578134 -d redirect_uri=https://web.skype.com \
+	-H "Accept: */*" -H "Content-type: application/x-www-form-urlencoded; charset=UTF-8" \
+	-H "BehaviorOverride: redirectAs404"`"
+
+SKYPE_TOKEN=`echo "$VERIFY_RESPONSE" | tr -d "\n" | sed -e 's/^.*="skypetoken" value="//g' -e 's/".*$//g'`
+
+update_registration_token() {
+	local TIME=`date +%s`
+	local TIMEHMAC=`timed_hmac $TIME`
+
+	local REG_RESPONSE="`curl -isL $WITH_COOKIES "https://$MESSAGES_HOST/v1/users/ME/endpoints" \
+		-H "Accept: */*" \
+		-H "Content-type: application/json" \
+		-H "ClientInfo: os=Windows; osVer=8.1; proc=Win32; lcid=en-us; deviceType=1; country=n/a; clientName=swx-skype.com; clientVer=908/1.85.0.29" \
+		-H "Accept-Language: en-US" \
+		-H "BehaviorOverride: redirectAs404" \
+		-H "LockAndKey: appId=${LOCKANDKEY_APPID}; time=$TIME; lockAndKeyResponse=$TIMEHMAC" \
+		-H "Authentication: skypetoken=$SKYPE_TOKEN" \
+		-d '{"endpointFeatures":"Agent"}'`"
+
+	if [[ "$REG_RESPONSE" =~ "Location: " ]]; then
+		NEW_HOST="`echo "$REG_RESPONSE" | grep '^Location: ' | sed -e 's/^.*Location: https:\/\///' -e 's/\/.*$//'`"
+		if [ "$NEW_HOST" != "$MESSAGES_HOST" ]; then
+			MESSAGES_HOST="$NEW_HOST"
+			echo "Messages host changed, will try again to get reg token: $MESSAGES_HOST"
+			update_registration_token
+			return
+		fi
+	fi
+
+	if [[ "$REG_RESPONSE" =~ "Set-RegistrationToken: " ]]; then
+		FULL_REG_TOKEN="`echo "$REG_RESPONSE" | grep '^Set-RegistrationToken:' | sed -e 's/^.*Set-RegistrationToken: //'`"
+		echo "Got reg token '$FULL_REG_TOKEN'"
+		REG_TOKEN="${FULL_REG_TOKEN%%;*}"
+		return
+	fi
+
+	echo "Failed to get reg token? $REG_RESPONSE"
+}
+
+timed_hmac() {
+# appId=msmsgs@msnmsgr.com; time=1526606805; lockAndKeyResponse=854b6704728f4be6a87d3144c1fb230a
+	local TIME="$1"
+
+	local nLow=0
+	local nHigh=0
+
+	local -a h1=(`echo -ne "$TIME$LOCKANDKEY_SECRET" | openssl sha256 -binary | od -A none -t u4 -w16 --endian=little | head -1`)
+
+	# pad to 8 bytes
+	local chlStr="${TIME}${LOCKANDKEY_APPID}0000000"
+	chlStr="${chlStr:0:$(( ${#chlStr} >> 3 << 3 ))}"
+
+	local MAX_INT=0x7fffffff
+
+	local fst snd
+	while read fst snd; do 
+		local temp=0
+		temp=$(( ( 0x0E79A9C1 * $fst ) % $MAX_INT ))
+		temp=$(( ( (${h1[0]} & $MAX_INT) * ($temp + $nLow) + (${h1[1]} & $MAX_INT) ) % $MAX_INT ))
+
+		nHigh=$(( $nHigh + $temp ))
+
+		temp=$(( ($snd + $temp) % $MAX_INT ))
+		nLow=$(( ( (${h1[2]} & $MAX_INT) * $temp + (${h1[3]} & $MAX_INT)) % $MAX_INT ))
+
+		nHigh=$(( $nHigh + $nLow ))
+	done < <(echo -ne "$chlStr" | od -A none -t u4 -w8 --endian=little )
+
+	nLow=$(( ($nLow + (${h1[1]} & $MAX_INT)) % $MAX_INT ))
+	nHigh=$(( ($nHigh + (${h1[3]} & $MAX_INT)) % $MAX_INT ))
+
+	local -a out=( $(( ${h1[0]} ^ $nLow )) $(( ${h1[1]} ^ $nHigh )) $(( ${h1[2]} ^ $nLow )) $(( ${h1[3]} ^ $nHigh )) )
+
+	printf "%08x%08x%08x%08x" ${out[0]} ${out[1]} ${out[2]} ${out[3]} | sed -e 's/\(..\)\(..\)\(..\)\(..\)/\4\3\2\1/g'
+}
+
+update_registration_token
+
+# MSG_PARAMS="view=msnp24Equivalent&targetType=Passport|Skype|Lync|Thread|PSTN|Agent"
+MSG_PARAMS="view=supportsExtendedHistory%7Cmsnp24Equivalent&targetType=Passport|Skype|Lync|Thread|PSTN|Agent"
+
+query_messages() {
+	local URL="$1"
+
+	curl $WITH_COOKIES -sL "https://$MESSAGES_HOST$URL" \
+		-H "RegistrationToken: $REG_TOKEN" -H "Referer: https://web.skype.com/main" -H "Accept: application/json; ver=1.0" \
+		-H "ClientInfo: os=Windows; osVer=8.1; proc=Win32; lcid=en-us; deviceType=1; country=n/a; clientName=swx-skype.com; clientVer=908/1.85.0.29" \
+		-H "Accept-Language: en-US" 
+}
+
+# get all conversations since $SINCE
+
+mkdir -p "$OUTPUT_DIR"
+
+SINCE_TS=`date +%s -d "$SINCE"`
+
+echo "Finding conversations since '$SINCE' ($SINCE_TS).."
+
+query_messages "/v1/users/ME/conversations?startTime=${SINCE_TS}000&pageSize=200&$MSG_PARAMS" | \
+	jq . > "$OUTPUT_DIR/conversations.json"
+
+for conv in `jq -r .conversations[].id < "$OUTPUT_DIR/conversations.json"`; do
+
+	count=0
+	CONV_FN="`echo $conv | tr -c '[:alnum:]-' '_'`"
+
+	query_messages "/v1/users/ME/conversations/$conv?$MSG_PARAMS" | jq . > "$OUTPUT_DIR/conv_${CONV_FN}.json"
+
+	NEXT_URL="/v1/users/ME/conversations/$conv/messages?startTime=${SINCE_TS}000&pageSize=200&$MSG_PARAMS"
+
+	while [ -n "$NEXT_URL" ]; do
+		echo "Downloading $conv / $count : $NEXT_URL"
+		file="$OUTPUT_DIR/conv_${CONV_FN}_${count}.json"
+		query_messages $NEXT_URL | jq . > "$file"
+		NEXT_URL="`jq -r ._metadata.backwardLink < "$file"`"
+		NEXT_URL="${NEXT_URL#https://$MESSAGES_HOST}"
+		if [ "$NEXT_URL" == "null" ]; then NEXT_URL=""; fi
+		count=$(( $count + 1 ))
+	done
+
+done
+
+	
